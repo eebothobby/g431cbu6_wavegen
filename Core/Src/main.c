@@ -15,6 +15,8 @@
   *
   ******************************************************************************
   *
+  * Copyright 2026 Ashok Singhal
+  *
   * Create a DDS (Direct Digital Synthesis) system to generate waves on the 2
   * channels of a high speed DAC (DAC3) of an STM32G431CBU6 using circular DMA
   * from waveform data in memory driven by timers (6 and 7).
