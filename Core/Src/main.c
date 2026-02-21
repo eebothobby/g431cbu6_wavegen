@@ -416,8 +416,6 @@ void updatePwm() {
 	  }
 }
 
-// add/subtract to cperiod without under or overflow
-
 // Set the frequency of curwave to freq
 // Should only be called for curwave = 0 or 1
 int setFreq(float freq) {
