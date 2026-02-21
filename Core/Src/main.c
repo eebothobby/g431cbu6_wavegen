@@ -42,7 +42,7 @@
   * The user interface:
   * ENC2: adjust frequency/wave type/amplitude/offset for the current wave
   * ENCSW2: select mode for the enc2
-  * SW4: Set the changes from ENC1/ENCSW1
+  * SW4: (currently unused)
   * SW3: Select the current wave (curwave)
   *
   * ENC1: adjust frequency and duty cycle for PWM
@@ -52,15 +52,18 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32g4xx_hal.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <limits.h>
 #include "gwave.h"
 #include "st7789.h"
 #include "seesaw.h"
@@ -186,8 +189,6 @@ uint8_t curwave = 0; // 0, 1 = wave0, wave1
 uint32_t prescalerHz[2];  // frequency after prescaler
 uint32_t sampleHz[2]; // sampling Frequency (after period)
 float waveHz[2];
-// Whether the waveHz or wtype has been changed and needs to be set
-int waveChanged[2] = {0, 0};
 float pwmhz; // pwm hz
 float pwmdpct; // and duty cycle %
 
@@ -218,6 +219,13 @@ static void MX_TIM3_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// saturating uint16_t addition
+uint16_t sat_add16(uint16_t a, uint16_t b) {
+  uint16_t result = a + b;
+  return result < a ? UINT16_MAX : result;
+}
+
 void USB_Printf(const char* fmt, ...) {
     char buf[128];
     va_list args;
@@ -250,7 +258,7 @@ float offset(uint16_t dacv, uint16_t potv) {
 // Display is 240x280 means a line can be 21 chars wide
 // 0:  Wavegen
 // 1: wave0 	wave1
-// 2: freq0  	freq1 	set>
+// 2: freq0  	freq1 	>
 // 3: shape0  	shape1
 // 4: ampl0	ampl1  	   enc1b>
 // 5: off0		off1
@@ -270,21 +278,21 @@ void Display() {
 
 	// row 1
 	row++;
-	ST7789_WriteString(2*xsp, row * ysp, " Wave0", Font_11x18, waveChanged[0]? fcol_changed: fcol,
+	ST7789_WriteString(2*xsp, row * ysp, " Wave0", Font_11x18, fcol,
 			(curwave == 0)? bcol_cur: bcol);
-	ST7789_WriteString(8*xsp, row * ysp, " Wave1", Font_11x18, waveChanged[1]? fcol_changed: fcol,
+	ST7789_WriteString(8*xsp, row * ysp, " Wave1", Font_11x18, fcol,
 			(curwave == 1)? bcol_cur: bcol);
 
 	// row 2: Wave frequencies and Set> button (S4).  Needs to start at X offset due to rounded edge
 	row++;
 	ST7789_WriteString(0, row * ysp, "Hz", Font_11x18, YELLOW, BLUE);
 	sprintf(buf, "%7d", (int) (waveHz[0]));
-	ST7789_WriteString(2*xsp, row * ysp, buf, Font_11x18, waveChanged[0]? fcol_changed: fcol,
+	ST7789_WriteString(2*xsp, row * ysp, buf, Font_11x18, fcol,
 			(encsw2Mode > 0 && encsw2Mode < 6 && curwave == 0)? bcol_cur: bcol);
 	sprintf(buf, "%7d", (int) (waveHz[1]));
-	ST7789_WriteString(9*xsp, row * ysp, buf, Font_11x18, waveChanged[1]? fcol_changed: fcol,
+	ST7789_WriteString(9*xsp, row * ysp, buf, Font_11x18, fcol,
 			(encsw2Mode > 0 && encsw2Mode < 6 && curwave == 1)? bcol_cur: bcol);
-	ST7789_WriteString(16*xsp, row * ysp, " Set", Font_11x18, BLUE, WHITE);
+	ST7789_WriteString(16*xsp, row * ysp, "    ", Font_11x18, BLUE, WHITE);
 
 	// row 3: Wave types and current encoder 1 mode
 	row++;
@@ -408,55 +416,104 @@ void updatePwm() {
 	  }
 }
 
+// add/subtract to cperiod without under or overflow
+
 // Set the frequency of curwave to freq
 // Should only be called for curwave = 0 or 1
 int setFreq(float freq) {
-	float targetSampleFreq;
-	uint16_t targetPeriod;
-	int targetNumSamples;
+  // freq = prescaleHz/((period+1)*num_samples)
+  // product = (perdiod+1)*num_samples = prescaleHz/freq
+  uint16_t cperiod = curwave == 0? period6: period7;
+  uint16_t cnsamples = num_samples[curwave];
+  uint32_t curProduct = (cperiod+ 1) * cnsamples;
+  uint32_t newProduct = prescalerHz[curwave]/freq;
+  int32_t delProduct = newProduct - curProduct;
 
-	// max sample freq given the prescalerHz determined by MIN_PERIOD
-	// and min sample freq is determined by MAX_PERIOD
-	uint32_t maxSampleFreq = prescalerHz[curwave]/(MIN_PERIOD + 1);
-	uint32_t minSampleFreq = prescalerHz[curwave]/(MAX_PERIOD + 1);
-	// Calculate the min and max wave frequencies
-	float minWaveFreq = minSampleFreq / MAX_SAMPLES;
-	uint32_t maxWaveFreq = maxSampleFreq/ MIN_SAMPLES;
-	// max freq with MAX_SAMPLES
-	uint32_t maxMaxSampleFreq = maxSampleFreq/MAX_SAMPLES;
+  if (delProduct == 0) {
+    if (freq > waveHz[curwave]) {
+      delProduct = -1;
+    } else if (freq < waveHz[curwave]) {
+      delProduct = 1;
+    }
+  }
 
-	if ((freq < minWaveFreq) || (freq > maxWaveFreq)) {
-		USB_Printf("freq out of range\r\n");
-		return 0;
-	}
-
-	if (freq <= maxMaxSampleFreq) {
-		// Can use max samples
-		targetSampleFreq = freq * MAX_SAMPLES;
-		targetPeriod = (uint16_t) ceil((prescalerHz[curwave] / targetSampleFreq) - 1);
-		if (targetPeriod < MIN_PERIOD) {
-			targetPeriod = MIN_PERIOD;
-		}
-		targetSampleFreq = prescalerHz[curwave]/(targetPeriod + 1);
-		// adjust num_samples to get closer to desired freq
-		targetNumSamples = (int) (targetSampleFreq/freq);
-		if (targetNumSamples > MAX_SAMPLES) {
-			targetNumSamples = MAX_SAMPLES;
-		}
-	} else {
-		// cannot use MAX_SAMPLES
-		targetNumSamples = (int) (maxSampleFreq/freq);
-		if (targetNumSamples < MIN_SAMPLES) {
-			targetNumSamples = MIN_SAMPLES;
-		}
-		targetSampleFreq = targetNumSamples * freq;
-		targetPeriod = (uint16_t) ((prescalerHz[curwave] / targetSampleFreq) - 1);
-		if (targetPeriod < MIN_PERIOD) {
-			targetPeriod = MIN_PERIOD;
-		}
-	}
-
-	num_samples[curwave] = targetNumSamples;
+  if (delProduct > 0) {
+    if (cnsamples < MAX_SAMPLES) {
+      // cnsamples can be increased
+      if (delProduct >= cperiod + 1) {
+        // can increase cnsamples
+        cnsamples += delProduct/(cperiod+1);
+        if (cnsamples > MAX_SAMPLES) {
+          cperiod = (newProduct/MAX_SAMPLES) - 1;
+          cnsamples = MAX_SAMPLES;
+        }
+      } else if (delProduct >= cnsamples){
+        // can increase cperiod
+        sat_add16(cperiod, delProduct/cnsamples);
+      } else {
+        // delProduct is less than both cnsamples and cperiod+1 so
+        // increase the larger of the two
+        if (cnsamples > cperiod + 1) {
+          cnsamples += 1;
+        } else {
+          cperiod += 1;
+        }
+      }
+    } else {
+      // cnsamples == MAX_SAMPLES, so increase period if possible
+      if (delProduct < cnsamples) {
+        cperiod += 1;
+        cnsamples = newProduct / (cperiod + 1);
+        if ((cperiod + 1) * cnsamples < curProduct) {
+          cnsamples += 1;
+        }
+        if (cnsamples < MIN_SAMPLES) {
+          cnsamples = MIN_SAMPLES;
+        }
+        if (cnsamples > MAX_SAMPLES) {
+          cnsamples = MAX_SAMPLES;
+        }
+      } else {
+       cperiod = sat_add16(cperiod, delProduct/cnsamples);
+      }
+      
+    }
+  } else { // delProduct < 0
+    if (cperiod > MIN_PERIOD) {
+      if (-delProduct < cnsamples) {
+        cperiod -= 1;
+        cnsamples = newProduct/(cperiod + 1);
+        if ((cperiod + 1) * cnsamples > curProduct) {
+          cnsamples -= 1;
+        }
+        if (cnsamples < MIN_SAMPLES) {
+          cnsamples = MIN_SAMPLES;
+        }
+        if (cnsamples > MAX_SAMPLES) {
+          cnsamples = MAX_SAMPLES;
+        }
+      } else {
+        cperiod += delProduct/cnsamples;
+      }
+    } else {
+      // cperiod == MIN_PERIOD, can only decrease cnamples
+      if (cnsamples > MIN_SAMPLES) {
+        if (-delProduct < cperiod + 1) {
+          cnsamples -= 1;
+        } else {
+          cnsamples += delProduct/(cperiod + 1);
+        }
+        if (cnsamples < MIN_SAMPLES) {
+          cnsamples = MIN_SAMPLES;
+        }
+      } else {
+        // no change possible
+        return 0;
+      }
+    }
+  }
+  // apply the changes
+  num_samples[curwave] = cnsamples;
 	if (num_samples[curwave] < MAX_SAMPLES/2) {
 		num_waves[curwave] = MAX_SAMPLES/num_samples[curwave];
 	} else {
@@ -471,14 +528,15 @@ int setFreq(float freq) {
 		USB_Printf("HAL_DAC_Start_DMA failed");
 	}
 	if (curwave == 1) {
-		period7 = targetPeriod;
+		period7 = cperiod;
 	} else {
-		period6 = targetPeriod;
+		period6 = cperiod;
 	}
-	__HAL_TIM_SET_AUTORELOAD(htim[curwave],targetPeriod);
+	__HAL_TIM_SET_AUTORELOAD(htim[curwave],cperiod);
 	updateClocks();
 	return 1;
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -616,12 +674,7 @@ int main(void)
 					  redisplay = 1;
 					  break;
 				  case SS_SW4:
-					  if (waveChanged[curwave]) {
-						  if (setFreq(waveHz[curwave])) {
-							  waveChanged[curwave] = 0;
-						  }
-					  }
-					  redisplay = 1;
+					  // XXX not used
 					  break;
 				  case SS_SW3:
 					  curwave = 1 - curwave;
@@ -646,7 +699,7 @@ int main(void)
 	  // encoder1 adjusts wavetype/frequency/amplitude/offset for curwave
 	  encdiff1 = seesaw_getEncoderDelta(&ss, 1);
 	  if (encdiff1 != 0) {
-		  USB_Printf("encdiff1: %d\r\n", encdiff1);
+       USB_Printf("encdiff1: %d\r\n", encdiff1);
 		  switch (encsw2Mode) {
 		  case 0:
 			  wtype[curwave] = (wtype[curwave] + encdiff1) % 5;
@@ -654,21 +707,20 @@ int main(void)
 			  initWave(wtype[curwave], wave[curwave], num_samples[curwave], num_waves[curwave]);
 			  break;
 		  case 1:
-			  if (abs(encdiff1) == 2) {
+			  if ((abs(encdiff1) > 2) && (abs(encdiff1) < 4)) {
 				  encdiff1 *= 4;
-			  } else if (abs(encdiff1) == 3) {
-				  encdiff1 *= 16;
-			  } else if (abs(encdiff1) == 4) {
-				  encdiff1 *= 64;
-			  } else if (abs(encdiff1) == 5) {
-				  encdiff1 *= 256;
-			  } else if (abs(encdiff1) == 6) {
+			  } else if ((abs(encdiff1) >= 4) && (abs(encdiff1) < 7)) {
+				  encdiff1 *= 32;
+        } else if (abs(encdiff1) >= 7) {
 				  encdiff1 *= 1024;
-			  } else if (abs(encdiff1) > 6) {
-				  encdiff1 *= 4096;
-			  }
-			  waveHz[curwave] = waveHz[curwave] + encdiff1;
-			  waveChanged[curwave] = 1;
+			  } 
+			  // waveHz[curwave] = waveHz[curwave] + encdiff1;
+        // XXX Assuming mininum freq of 1
+        if (waveHz[curwave] + encdiff1 < 1) {
+          setFreq(1);
+        } else {
+          setFreq(waveHz[curwave] + encdiff1);
+        }
 			  break;
 		  case 2:
 			  // Want the resistance (gain) to increase so we subtract
